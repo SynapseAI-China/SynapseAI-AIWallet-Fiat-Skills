@@ -1,25 +1,26 @@
 ---
 name: synapseai-fiat-payments
-metadata: {"skill_profile":{"version":"1.4.0","revision":"2026-03-27.3"},"fiat_cli":{"package":"@panda1105021243/fiat-cli-devtest","auto_update":"major","major_requires_confirm":false,"check_cmd":"npm view @panda1105021243/fiat-cli-devtest version","upgrade_cmd":"npm install -g @panda1105021243/fiat-cli-devtest@latest"}}
+metadata: {"skill_profile":{"version":"2.0.0","revision":"2026-04-30.1"},"fiat_cli":{"package":"@panda1105021243/fiat-cli-devtest","auto_update":"major","major_requires_confirm":false,"check_cmd":"npm view @panda1105021243/fiat-cli-devtest version","upgrade_cmd":"npm install -g @panda1105021243/fiat-cli-devtest@latest"}}
 description: >
-  Buyer-side wallet payment skill. Use for setup, readiness checks, discovering purchasable
-  offers, and paying via x402/direct with fiat-cli.
+  Buyer-side CNY fiat payment skill. Use for setup, readiness checks, discovering
+  purchasable offers, paying merchant agents, and checking payment settlement via fiat-cli.
 ---
 
 # SynapseAI Fiat Payments
 
 ## Core Rules
 
-1. Always use `fiat-cli` commands. Never replace with raw HTTP or unrelated APIs.
-2. If user asks for x402, never downgrade to non-x402 data sources.
-3. Before multi-step actions, run `fiat-cli whoami` once.
-4. Keep clarification minimal: at most one blocking question.
-5. If the user explicitly requests setup or re-setup, always run `fiat-cli register ...` to create a new agent, even if an active agent already exists.
-6. If the caller passes custom `--headers`, keep header names and values HTTP-safe ASCII unless the target explicitly documents another encoding contract.
+1. Always use `fiat-cli` commands. Do not replace payment actions with raw HTTP or unrelated APIs.
+2. Treat the wallet as a CNY account. Do not convert amounts into crypto units or chain concepts.
+3. Before multi-step actions, run `fiat-cli whoami` once and use the resulting current agent unless the user names another agent.
+4. Do not retry a settled payment. If a response contains `payment_id`, use `fiat-cli payment status --payment-id <id>` for follow-up.
+5. If a payment returns `REQUIRE_APPROVAL`, return the `approval_url` and stop. The owner approval flow completes settlement.
+6. Keep clarification minimal: ask at most one blocking question, and only when the target or amount cannot be inferred.
+7. Treat `order_id` as payable only when the order is in `PENDING` state. If the order is not pending, stop and report the state issue.
 
 ## CLI Sync Policy
 
-Run version sync **once at session start**:
+Run version sync once at session start:
 - `npm view @panda1105021243/fiat-cli-devtest version`
 - `fiat-cli --version`
 
@@ -39,75 +40,50 @@ Route user intent to one command family:
   - Always switch default to the new agent immediately
   - Confirm with: `fiat-cli whoami --agent-id <new_agent_id>`
   - Reply must state: "已切换到新 Agent: <new_agent_id>"
-  - wait for owner bind if needed
+  - Wait for owner bind if needed.
 
 - Wallet status / readiness / policy / balance
-  - Always run `fiat-cli whoami` before reporting status
-  - For multi-agent checks, run `fiat-cli whoami --agent-id <id>` for each agent before summary
-  - if troubleshooting: `fiat-cli doctor`
+  - Run `fiat-cli whoami`
+  - If troubleshooting, run `fiat-cli doctor`
 
-- Discover purchasable offers
+- Discover purchasable merchant offers
   - Primary: `fiat-cli merchant catalog`
   - Fallback: `fiat-cli merchant offer list --status ACTIVE [--merchant-id <merchant_code>]`
   - Fallback for merchant existence: `fiat-cli merchant list`
 
-- Spend via x402 (paid external API)
-  - `fiat-cli spend x402 ...`
+- Pay a merchant agent
+  - By payment link: `fiat-cli spend fiat --payment-link-id <id> [--amount <CNY>] --purpose <text>`
+  - By offer: `fiat-cli spend fiat --offer-id <id> [--amount <CNY>] --purpose <text>`
+  - By pending order: `fiat-cli spend fiat --order-id <id> [--amount <CNY>] --purpose <text>`
+  - By merchant code: `fiat-cli spend fiat --merchant-code <code> --amount <CNY> --purpose <text>`
 
-- Spend direct (internal balance deduction)
-  - `fiat-cli spend direct ...`
+- Check payment settlement
+  - `fiat-cli payment status --payment-id <id>`
 
 - Multi-agent targeting
   - default: `current_agent_id`
   - temporary target: add `--agent-id`
   - change default only when user explicitly asks: `fiat-cli agent use --agent-id <id>`
 
-## Parameter Resolution Contract
+## Discovery Gate
 
-Auto-fill missing fields with deterministic defaults.
+Before paying, resolve the payment target:
+- Prefer `payment_link_id`, `offer_id`, or `order_id` when the user provides one.
+- For `order_id`, proceed only when the order is pending payment.
+- If only merchant intent is provided, resolve `merchant_code` and exact CNY amount.
+- Treat `merchant catalog` as the canonical aggregated view for merchant code, active offers, unit price, and payment target.
+- `--merchant-id` expects `merchant_code`, not a database primary id.
 
-### Spend x402 defaults
-- `method`: `GET`
-- `amount-hint`: `0.001`
-- `purpose`: `x402 call`
-- If buying platform-internal offers, use merchant/endpoint from Discovery Gate results.
+If target or amount remains ambiguous, do not pay. Return the missing field in plain language.
 
-### Spend direct defaults
-- `merchant`: `openai_api`
-
-### URL resolution priority for x402
-- If user provides URL: use it directly.
-- If user intent is to buy platform-internal merchant offers: run Discovery Gate first and use discovered endpoint.
-- Otherwise, ask one concise question for target endpoint/provider.
-
-## Discovery Gate (Required for x402 purchase)
-
-Before any x402 purchase, resolve all required fields:
-- `merchant` (target merchant)
-- `offer` (valid product/service)
-- `unit_price` (price)
-- `endpoint` / `target_url` (paid endpoint)
-
-If any field is missing, do not pay. Return missing fields explicitly.
-
-Recommended command sequence:
-- `fiat-cli merchant catalog` (primary, agent context required)
-- If catalog is incomplete or fails: `fiat-cli merchant offer list --status ACTIVE [--merchant-id <merchant_code>]` (agent context required)
-- If merchant existence needs verification: `fiat-cli merchant list` (public discovery, no agent token required)
-
-Parameter semantics:
-- `--merchant-id` expects **merchant_code** (for example: `x402engine`), not database primary id.
-
-`merchant catalog` should be treated as the canonical aggregated view for: merchant + active offers + unit_price + endpoint/payment_link.
-
-## Payment Readiness Gate (Required)
+## Readiness Gate
 
 Before any spend, ensure:
 - `is_bound = true`
 - `available_balance > 0`
-- policy exists (`daily_limit`, `tx_limit`, `approval_threshold`)
+- policy exists with `daily_limit`, `tx_limit`, and `approval_threshold`
 
-If not ready, do not pay. Return exact missing items and next action in SynapseAI dashboard.
+If not ready, do not pay. Return the exact missing item and the next dashboard action.
 
 ## Error Handling Contract
 
@@ -119,15 +95,15 @@ Use strict, actionable outcomes:
 
 - `REJECT` / `RISK_RULE_REJECTED`
   - Return `reason_code`.
-  - Tell user to adjust limits/whitelist/policy in SynapseAI dashboard.
+  - Tell the user to adjust limits, allowlist, or policy in SynapseAI dashboard.
 
 - `INSUFFICIENT_BALANCE`
-  - Tell user to fund wallet.
-  - Suggest minimum working balance (e.g. `>= 0.01 USDC`).
+  - Tell the user to fund the wallet.
+  - Suggest a minimum CNY balance equal to or greater than the intended payment amount.
 
-- Target fetch/network failure
-  - Report target endpoint failure clearly.
-  - Do not switch to non-x402 providers.
+- Target not found / inactive
+  - Return the missing or inactive payment target.
+  - Re-run discovery only when the user asks you to find another target.
 
 ## Setup
 
@@ -154,23 +130,26 @@ fiat-cli whoami
 ## Command Examples
 
 ```bash
-# primary query path: purchasable catalog
+# purchasable catalog
 fiat-cli merchant catalog
 
 # fallback: list active offers
 fiat-cli merchant offer list --status ACTIVE
 
-# fallback: verify merchants
-fiat-cli merchant list
+# pay by payment link
+fiat-cli spend fiat --payment-link-id pl_xxxxxxxxxxxx --purpose "purchase service"
 
-# x402 spend
-fiat-cli spend x402 --url <execute_url> --method GET --amount-hint 0.001 --purpose "purchase offer"
+# pay by offer
+fiat-cli spend fiat --offer-id mof_xxxxxxxxxxxx --purpose "purchase offer"
 
-# direct spend
-fiat-cli spend direct --merchant openai_api --amount 5.0 --purpose "GPT-4 API credits"
+# pay by pending order
+fiat-cli spend fiat --order-id ord_xxxxxxxxxxxx --purpose "pay order"
 
-# health check
-fiat-cli doctor
+# pay by merchant code and amount
+fiat-cli spend fiat --merchant-code premium_api --amount 9.90 --purpose "API credits"
+
+# check settlement
+fiat-cli payment status --payment-id pay_xxxxxxxxxxxx
 ```
 
 ## State Rules
@@ -188,9 +167,10 @@ fiat-cli doctor
 |---|---|---|
 | `fiat-cli: command not found` | CLI missing | Install CLI and retry |
 | `--token is required` | missing agent token in state | register target agent or use correct `--agent-id` |
-| `REQUIRE_APPROVAL` | amount exceeds threshold | return approval URL, wait for owner |
+| `REQUIRE_APPROVAL` | policy requires owner decision | return approval URL, wait for owner |
 | `REJECT` | policy violation | return reason and stop |
 | insufficient balance | wallet not funded | fund wallet, retry |
+| target not found | missing or wrong payment target | run discovery and use a valid target |
 | 401 invalid token | expired/wrong token | re-register |
 | state missing | wrong path or first run | use user-level state path and register once |
-| policy is null / missing limits | agent trading policy not configured | configure daily_limit / tx_limit / approval_threshold in SynapseAI dashboard |
+| policy is null / missing limits | spending policy not configured | configure daily_limit / tx_limit / approval_threshold in SynapseAI dashboard |
